@@ -1,14 +1,17 @@
 """Два интерфейса одной модели. Запуск: python service.py http или grpc."""
 
 import argparse
+import base64
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 
 import grpc
+import predict_pb2
 import predict_pb2_grpc
 import uvicorn
-from fastapi import FastAPI
-from model import MAX_IMAGE_BYTES, ModelRunner
-from pydantic import BaseModel, ConfigDict, Field
+from fastapi import FastAPI, HTTPException
+from model import MAX_IMAGE_BYTES, CaptionInput, ModelRunner
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 
 class HttpCaptionInput(BaseModel):
@@ -33,13 +36,23 @@ app = FastAPI(lifespan=lifespan)
 @app.get("/health")
 def health():
     """Верните готовность сервиса и версию модели, загруженной при старте."""
-    raise NotImplementedError("Верните готовность и версию загруженной модели")
+    return {"ready": True, "model_version": app.state.runner.model_version}
 
 
 @app.post("/predict")
 def predict_http(request: HttpCaptionInput):
     """Примите картинку в base64 и верните результат модели. Ошибка входных данных даёт HTTP 422."""
-    raise NotImplementedError("Преобразуйте HTTP-запрос, вызовите модель и верните ответ")
+    try:
+        image = base64.b64decode(request.image_base64, validate=True)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail="Invalid image_base64") from error
+
+    try:
+        value = CaptionInput(image=image, max_new_tokens=request.max_new_tokens)
+    except (ValidationError, SyntaxError) as error:
+        # Pillow может сообщить о повреждённом PNG через SyntaxError.
+        raise HTTPException(status_code=422, detail="Invalid caption input") from error
+    return app.state.runner.predict(value, protocol="http")
 
 
 class Predictor(predict_pb2_grpc.PredictorServicer):
@@ -50,13 +63,22 @@ class Predictor(predict_pb2_grpc.PredictorServicer):
 
     def Predict(self, request, context):
         """Возвращает PredictionResponse; неверный ввод отклоняет со статусом INVALID_ARGUMENT."""
-        # Отсутствующий лимит и переданный 0 имеют разный смысл для модели.
-        context.abort(grpc.StatusCode.UNIMPLEMENTED, "Реализуйте Predict")
+        if not request.HasField("image"):
+            context.abort(grpc.StatusCode.INVALID_ARGUMENT, "Missing image")
+        tokens = request.max_new_tokens if request.HasField("max_new_tokens") else None
+        try:
+            value = CaptionInput(image=request.image, max_new_tokens=tokens)
+        except (ValidationError, SyntaxError):
+            context.abort(grpc.StatusCode.INVALID_ARGUMENT, "Invalid caption input")
+
+        return predict_pb2.PredictionResponse(**self.runner.predict(value, protocol="grpc"))
 
 
 def build_grpc_server(runner):
     """Верните сервер с зарегистрированным Predictor. Порт выбирает вызывающий код."""
-    raise NotImplementedError("Создайте gRPC-сервер и зарегистрируйте Predictor")
+    server = grpc.server(ThreadPoolExecutor(max_workers=4))
+    predict_pb2_grpc.add_PredictorServicer_to_server(Predictor(runner), server)
+    return server
 
 
 def serve_grpc():
